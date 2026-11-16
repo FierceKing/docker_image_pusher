@@ -1,0 +1,12 @@
+# Dependabot 配置：自动监测 GitHub Actions 版本
+# 作用：用浮动主版本标签（actions/checkout@v7、docker/login-action@v4）时，
+#       补丁级别不会产生 PR；只有出现新的“主版本”（如 v8）才会自动开 PR 提醒你。
+#       合并前务必看 diff + 等 CI 跑绿，不要盲合。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+    open-pull-requests-limit: 3
