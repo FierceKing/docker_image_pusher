@@ -1,5 +1,4 @@
 name: Docker Mirror Sync
-
 on:
   workflow_dispatch:
   push:
@@ -10,7 +9,6 @@ env:
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
-  # 固定你的目标仓库名，不要改
   TARGET_REPO: "maximus-hub"
 
 jobs:
@@ -34,13 +32,9 @@ jobs:
           remove-haskell: 'true'
           remove-android: 'true'
           remove-codeql: 'true'
-          build-mount-path: '/var/lib/docker/'
 
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
-
-      - name: Restart docker
-        run: sudo service docker restart
 
       - name: Free up disk space complete
         run: |
@@ -59,36 +53,37 @@ jobs:
           username: ${{ env.ALIYUN_REGISTRY_USER }}
           password: ${{ env.ALIYUN_REGISTRY_PASSWORD }}
 
-      # 可选：DHI(dhi.io) 需要docker hub账号登录，不需要就注释掉这一段
+      # 不需要 DHI 镜像时注释掉这一段
       - name: Login to dhi.io (DHI)
         uses: docker/login-action@v3
         with:
           registry: dhi.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ secrets.DHI_REGISTRY_USER }}
+          password: ${{ secrets.DHI_REGISTRY_TOKEN }}
 
       - name: Sync images from images.txt to Aliyun ACR
         run: |
           #!/usr/bin/env bash
           set -eo pipefail
-          shopt -s inherit_errexit
+          shopt -s inherit_errexit 2>/dev/null || true
 
-          declare -A temp_map
+          if [[ ! -f images.txt ]]; then
+            echo "[ERROR] images.txt not found in repo!"
+            exit 1
+          fi
+
           declare -A seen_lines
-          declare -A seen_lines_processed
+          declare -A seen_final_tag
           success_count=0
           fail_count=0
+          lines=()
 
-          # 【新版解析函数】
-          # 输入完整镜像引用，例如 dhi.io/vaultwarden:1-debian  / vaultwarden/server:1.37.5-alpine
-          # 输出安全tag：把所有 / : 替换成 -，保证能放进单仓库的tag里
           make_safe_tag() {
             local raw="$1"
-            # 替换 / : 为 -
             echo "$raw" | sed 's/[\/:]/-/g'
           }
 
-          # 第一轮：冲突检测 + 去重
+          # 一次性读入内存，全程不再二次读文件
           while IFS= read -r line || [[ -n "$line" ]]; do
             line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [[ -z "$line" ]] && continue
@@ -98,30 +93,41 @@ jobs:
               continue
             fi
             seen_lines["$line"]=1
+            lines+=("$line")
 
             read -r -a args <<< "$line"
             raw_img_ref="${args[-1]}"
+
+            platform=""
+            for ((i=0; i<${#args[@]}-1; i++)); do
+              if [[ "${args[$i]}" == "--platform" ]]; then
+                platform="${args[$i+1]}"
+                break
+              fi
+            done
+
             safe_tag=$(make_safe_tag "$raw_img_ref")
-            temp_map["$safe_tag"]=1
+            platform_prefix=""
+            if [[ -n "$platform" ]]; then
+              platform_prefix="${platform//\//_}-"
+            fi
+            final_tag="${platform_prefix}${safe_tag}"
+            if [[ -n "${seen_final_tag[$final_tag]}" ]]; then
+              echo "[FATAL CONFLICT] target tag collision: ${final_tag}, line: $line"
+              exit 1
+            fi
+            seen_final_tag["$final_tag"]=1
           done < images.txt
 
-          # 第二轮：拉取、buildx复制manifest推送、清理
-          while IFS= read -r line || [[ -n "$line" ]]; do
-            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            [[ -n "${seen_lines_processed[$line]}" ]] && continue
-            seen_lines_processed["$line"]=1
-
+          for line in "${lines[@]}"; do
             echo "============================================================"
             echo "[PROCESS] $line"
             read -r -a args <<< "$line"
             raw_img_ref="${args[-1]}"
 
-            # 提取 --platform 参数
             platform=""
-            for ((i=0; i<${#args[@]}; i++)); do
-              if [[ "${args[$i]}" == "--platform" && -n "${args[$i+1]}" ]]; then
+            for ((i=0; i<${#args[@]}-1; i++)); do
+              if [[ "${args[$i]}" == "--platform" ]]; then
                 platform="${args[$i+1]}"
                 break
               fi
@@ -133,29 +139,23 @@ jobs:
               platform_prefix="${platform//\//_}-"
             fi
 
-            # 固定目标：ALIYUN_REGISTRY / ALIYUN_NAME_SPACE / TARGET_REPO : tag
             new_image="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${{ env.TARGET_REPO }}:${platform_prefix}${safe_tag}"
             echo "[TARGET] $new_image"
 
             set +e
-            # 用 buildx imagetools create 复制manifest，支持多架构镜像，规避 blob type invalid
             if docker buildx imagetools create --tag "${new_image}" "${raw_img_ref}"; then
               echo "[SUCCESS] $line"
               success_count=$((success_count + 1))
             else
-              echo "[FAIL] imagetools create failed: $line"
+              echo "[FAIL] $line"
+              echo "  Source: $raw_img_ref"
+              echo "  Target: $new_image"
               fail_count=$((fail_count + 1))
             fi
             set -e
 
-            # 清理本地镜像
-            docker rmi "$raw_img_ref" || true
-            # buildx imagetools 不会生成本地镜像，不需要 rmi new_image
-
-            echo "[DISK AFTER]"
-            df -hT
             echo "============================================================"
-          done < images.txt
+          done
 
           echo -e "\n===== SYNC SUMMARY ====="
           echo "Total Success: $success_count"
