@@ -10,6 +10,8 @@ env:
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+  # 固定你的目标仓库名，不要改
+  TARGET_REPO: "maximus-hub"
 
 jobs:
   build:
@@ -30,8 +32,6 @@ jobs:
           swap-size-mb: 128
           remove-dotnet: 'true'
           remove-haskell: 'true'
-          # remove-android: 'true'
-          # remove-codeql: 'true'
           build-mount-path: '/var/lib/docker/'
 
       - name: Restart docker
@@ -54,6 +54,14 @@ jobs:
           username: ${{ env.ALIYUN_REGISTRY_USER }}
           password: ${{ env.ALIYUN_REGISTRY_PASSWORD }}
 
+      # 可选：DHI(dhi.io) 需要docker hub账号登录，不需要就注释掉这一段
+      - name: Login to dhi.io (DHI)
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Sync images from images.txt to Aliyun ACR
         run: |
           #!/usr/bin/env bash
@@ -63,60 +71,34 @@ jobs:
           declare -A duplicate_images
           declare -A temp_map
           declare -A seen_lines
+          declare -A seen_lines_processed
           success_count=0
           fail_count=0
 
-          # 解析函数，输入完整镜像字符串，输出：raw_image image_name_tag name_space image_name
-          parse_image() {
-            local input="$1"
-            local image="${input%%@*}"
-            local image_name_tag
-            local name_space
-            local image_name
-
-            image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
-            # 支持 registry/ns/name 、ns/name、name 三种形式
-            local slash_cnt=$(grep -o '/' <<< "$image" | wc -l)
-            if [[ $slash_cnt -ge 2 ]]; then
-              name_space=$(echo "$image" | cut -d'/' -f2)
-            elif [[ $slash_cnt -eq 1 ]]; then
-              name_space=$(echo "$image" | cut -d'/' -f1)
-            else
-              name_space=""
-            fi
-            image_name=$(echo "$image_name_tag" | awk -F':' '{print $1}')
-
-            echo "$image|$image_name_tag|$name_space|$image_name"
+          # 【新版解析函数】
+          # 输入完整镜像引用，例如 dhi.io/vaultwarden:1-debian  / vaultwarden/server:1.37.5-alpine
+          # 输出安全tag：把所有 / : 替换成 -，保证能放进单仓库的tag里
+          make_safe_tag() {
+            local raw="$1"
+            # 替换 / : 为 -
+            echo "$raw" | sed 's/[\/:]/-/g'
           }
 
           # 第一轮：冲突检测 + 去重
           while IFS= read -r line || [[ -n "$line" ]]; do
-            # 清理首尾空白
             line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [[ -z "$line" ]] && continue
             [[ "$line" =~ ^[[:space:]]*# ]] && continue
-            # 去重
             if [[ -n "${seen_lines[$line]}" ]]; then
               echo "[SKIP DUPLICATE LINE] $line"
               continue
             fi
             seen_lines["$line"]=1
 
-            # 取最后一个参数为镜像引用
             read -r -a args <<< "$line"
             raw_img_ref="${args[-1]}"
-            parts=$(parse_image "$raw_img_ref")
-            IFS='|' read -r image image_name_tag name_space image_name <<< "$parts"
-
-            ns_key="${name_space}_"
-            if [[ -n "${temp_map[$image_name]}" ]]; then
-              if [[ "${temp_map[$image_name]}" != "$ns_key" ]]; then
-                echo "[CONFLICT DETECT] same image name, different namespace: $image_name"
-                duplicate_images[$image_name]="1"
-              fi
-            else
-              temp_map[$image_name]="$ns_key"
-            fi
+            safe_tag=$(make_safe_tag "$raw_img_ref")
+            temp_map["$safe_tag"]=1
           done < images.txt
 
           # 第二轮：拉取、打标、推送、清理
@@ -141,25 +123,19 @@ jobs:
               fi
             done
 
-            parts=$(parse_image "$raw_img_ref")
-            IFS='|' read -r image image_name_tag name_space image_name <<< "$parts"
-
-            # 构造前缀
+            safe_tag=$(make_safe_tag "$raw_img_ref")
             platform_prefix=""
             if [[ -n "$platform" ]]; then
               platform_prefix="${platform//\//_}-"
             fi
-            name_space_prefix=""
-            if [[ -n "${duplicate_images[$image_name]}" && -n "$name_space" ]]; then
-              name_space_prefix="${name_space}-"
-            fi
 
-            new_image="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${platform_prefix}${name_space_prefix}${image_name_tag}"
+            # 固定目标：ALIYUN_REGISTRY / ALIYUN_NAME_SPACE / TARGET_REPO : tag
+            new_image="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${{ env.TARGET_REPO }}:${platform_prefix}${safe_tag}"
             echo "[TARGET] $new_image"
 
             set +e
             if docker pull "${args[@]}"; then
-              docker tag "$image" "$new_image"
+              docker tag "$raw_img_ref" "$new_image"
               docker push "$new_image"
               echo "[SUCCESS] $line"
               success_count=$((success_count + 1))
@@ -167,8 +143,7 @@ jobs:
               echo "[FAIL] pull or push failed: $line"
               fail_count=$((fail_count + 1))
             fi
-            # 尽可能清理，清理失败不阻断统计
-            docker rmi "$image" || true
+            docker rmi "$raw_img_ref" || true
             docker rmi "$new_image" || true
             set -e
 
