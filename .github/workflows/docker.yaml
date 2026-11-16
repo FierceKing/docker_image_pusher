@@ -28,11 +28,16 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
         with:
-          root-reserve-mb: 2048
+          root-reserve-mb: 4096
           swap-size-mb: 128
           remove-dotnet: 'true'
           remove-haskell: 'true'
+          remove-android: 'true'
+          remove-codeql: 'true'
           build-mount-path: '/var/lib/docker/'
+
+      - name: Enable buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Restart docker
         run: sudo service docker restart
@@ -68,7 +73,6 @@ jobs:
           set -eo pipefail
           shopt -s inherit_errexit
 
-          declare -A duplicate_images
           declare -A temp_map
           declare -A seen_lines
           declare -A seen_lines_processed
@@ -101,7 +105,7 @@ jobs:
             temp_map["$safe_tag"]=1
           done < images.txt
 
-          # 第二轮：拉取、打标、推送、清理
+          # 第二轮：拉取、buildx复制manifest推送、清理
           while IFS= read -r line || [[ -n "$line" ]]; do
             line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [[ -z "$line" ]] && continue
@@ -134,18 +138,19 @@ jobs:
             echo "[TARGET] $new_image"
 
             set +e
-            if docker pull "${args[@]}"; then
-              docker tag "$raw_img_ref" "$new_image"
-              docker push "$new_image"
+            # 用 buildx imagetools create 复制manifest，支持多架构镜像，规避 blob type invalid
+            if docker buildx imagetools create --tag "${new_image}" "${raw_img_ref}"; then
               echo "[SUCCESS] $line"
               success_count=$((success_count + 1))
             else
-              echo "[FAIL] pull or push failed: $line"
+              echo "[FAIL] imagetools create failed: $line"
               fail_count=$((fail_count + 1))
             fi
-            docker rmi "$raw_img_ref" || true
-            docker rmi "$new_image" || true
             set -e
+
+            # 清理本地镜像
+            docker rmi "$raw_img_ref" || true
+            # buildx imagetools 不会生成本地镜像，不需要 rmi new_image
 
             echo "[DISK AFTER]"
             df -hT
