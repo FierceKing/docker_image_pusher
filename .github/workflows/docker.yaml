@@ -3,7 +3,7 @@ name: Docker Mirror Sync
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ FierceKing-patch-1 ]
 
 env:
   ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
