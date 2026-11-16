@@ -16,35 +16,17 @@ jobs:
     name: Pull & Sync To ACR
     runs-on: ubuntu-latest
     steps:
-      - name: Before freeing up disk space
-        run: |
-          echo "Before freeing up disk space"
-          echo "=============================================================================="
-          df -hT
-          echo "=============================================================================="
-
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@fc881a613ad2a34aca9c9624518214ebc21dfc0c
-        with:
-          root-reserve-mb: 4096
-          swap-size-mb: 128
-          remove-dotnet: 'true'
-          remove-haskell: 'true'
-          remove-android: 'true'
-          remove-codeql: 'true'
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
       - name: Enable buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Free up disk space complete
-        run: |
-          echo "Free up disk space complete"
-          echo "=============================================================================="
-          df -hT
-          echo "=============================================================================="
-
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to Aliyun ACR
         uses: docker/login-action@v3
@@ -53,19 +35,10 @@ jobs:
           username: ${{ env.ALIYUN_REGISTRY_USER }}
           password: ${{ env.ALIYUN_REGISTRY_PASSWORD }}
 
-      # 不需要 DHI 镜像时注释掉这一段
-      - name: Login to dhi.io (DHI)
-        uses: docker/login-action@v3
-        with:
-          registry: dhi.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Sync images from images.txt to Aliyun ACR
         run: |
           #!/usr/bin/env bash
           set -eo pipefail
-          shopt -s inherit_errexit 2>/dev/null || true
 
           if [[ ! -f images.txt ]]; then
             echo "[ERROR] images.txt not found in repo!"
@@ -74,90 +47,66 @@ jobs:
 
           declare -A seen_lines
           declare -A seen_final_tag
+          raw_refs=()
+          final_tags=()
           success_count=0
           fail_count=0
-          lines=()
 
+          # 把镜像引用里的 / 和 : 替换成 -，作为单仓库里的安全 tag
           make_safe_tag() {
-            local raw="$1"
-            echo "$raw" | sed 's/[\/:]/-/g'
+            printf '%s\n' "$1" | sed 's/[\/:]/-/g'
           }
 
-          # 一次性读入内存，全程不再二次读文件
+          # 第一轮：去重 → 解析 → 冲突预检查 → 暂存待同步项
           while IFS= read -r line || [[ -n "$line" ]]; do
-            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            line=$(printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            [[ -z "$line" || "$line" =~ ^# ]] && continue
             if [[ -n "${seen_lines[$line]}" ]]; then
-              echo "[SKIP DUPLICATE LINE] $line"
+              echo "[SKIP DUPLICATE] $line"
               continue
             fi
             seen_lines["$line"]=1
-            lines+=("$line")
 
             read -r -a args <<< "$line"
             raw_img_ref="${args[-1]}"
 
             platform=""
             for ((i=0; i<${#args[@]}-1; i++)); do
-              if [[ "${args[$i]}" == "--platform" ]]; then
-                platform="${args[$i+1]}"
-                break
-              fi
+              [[ "${args[$i]}" == "--platform" ]] && { platform="${args[$i+1]}"; break; }
             done
 
             safe_tag=$(make_safe_tag "$raw_img_ref")
             platform_prefix=""
-            if [[ -n "$platform" ]]; then
-              platform_prefix="${platform//\//_}-"
-            fi
+            [[ -n "$platform" ]] && platform_prefix="${platform//\//_}-"
             final_tag="${platform_prefix}${safe_tag}"
+
             if [[ -n "${seen_final_tag[$final_tag]}" ]]; then
-              echo "[FATAL CONFLICT] target tag collision: ${final_tag}, line: $line"
+              echo "[FATAL CONFLICT] target tag collision: $final_tag, line: $line"
               exit 1
             fi
             seen_final_tag["$final_tag"]=1
+
+            raw_refs+=("$raw_img_ref")
+            final_tags+=("$final_tag")
           done < images.txt
 
-          for line in "${lines[@]}"; do
+          # 第二轮：执行同步（imagetools 直接复制 manifest，不落本地磁盘）
+          for idx in "${!final_tags[@]}"; do
+            raw_img_ref="${raw_refs[$idx]}"
+            new_image="${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${TARGET_REPO}:${final_tags[$idx]}"
             echo "============================================================"
-            echo "[PROCESS] $line"
-            read -r -a args <<< "$line"
-            raw_img_ref="${args[-1]}"
+            echo "[SYNC] $raw_img_ref -> $new_image"
 
-            platform=""
-            for ((i=0; i<${#args[@]}-1; i++)); do
-              if [[ "${args[$i]}" == "--platform" ]]; then
-                platform="${args[$i+1]}"
-                break
-              fi
-            done
-
-            safe_tag=$(make_safe_tag "$raw_img_ref")
-            platform_prefix=""
-            if [[ -n "$platform" ]]; then
-              platform_prefix="${platform//\//_}-"
-            fi
-
-            new_image="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAME_SPACE }}/${{ env.TARGET_REPO }}:${platform_prefix}${safe_tag}"
-            echo "[TARGET] $new_image"
-
-            set +e
-            if docker buildx imagetools create --tag "${new_image}" "${raw_img_ref}"; then
-              echo "[SUCCESS] $line"
+            if docker buildx imagetools create --tag "$new_image" "$raw_img_ref"; then
+              echo "[SUCCESS] $raw_img_ref"
               success_count=$((success_count + 1))
             else
-              echo "[FAIL] $line"
-              echo "  Source: $raw_img_ref"
-              echo "  Target: $new_image"
+              echo "[FAIL] $raw_img_ref"
               fail_count=$((fail_count + 1))
             fi
-            set -e
-
-            echo "============================================================"
           done
 
-          echo -e "\n===== SYNC SUMMARY ====="
+          echo "===== SYNC SUMMARY ====="
           echo "Total Success: $success_count"
           echo "Total Failed:  $fail_count"
           if [[ $fail_count -gt 0 ]]; then
