@@ -12,7 +12,6 @@ env:
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
-  TARGET_REPO: "maximus-hub"
   # 目标 NAS 架构：amd64 = 主流 Intel/AMD 群晖；arm64 = ARM 群晖（如 DS223/DS124 等）
   MIRROR_ARCH: "amd64"
 
@@ -22,19 +21,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install skopeo
         run: sudo apt-get update -qq && sudo apt-get install -y -qq skopeo
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to Aliyun ACR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.ALIYUN_REGISTRY }}
           username: ${{ env.ALIYUN_REGISTRY_USER }}
@@ -54,18 +53,35 @@ jobs:
           SUMMARY="${GITHUB_STEP_SUMMARY:-/tmp/sync_summary.md}"
 
           declare -A seen_lines
-          declare -A seen_final_tag
+          declare -A seen_repo
           raw_refs=()
-          final_tags=()
+          repo_names=()
           success_count=0
           fail_count=0
 
-          # 把镜像引用里的 / 和 : 替换成 -，作为单仓库里的安全 tag
-          make_safe_tag() {
-            printf '%s\n' "$1" | sed 's/[\/:]/-/g'
+          # 把镜像引用转成 ACR 单层仓库名（ACR 仓库名不允许 '/'）：
+          #   vaultwarden/server        -> vaultwarden-server
+          #   vaultwarden/server:1.25   -> vaultwarden-server
+          #   docker.io/library/nginx   -> library-nginx
+          #   nginx                     -> nginx
+          repo_name_of() {
+            local ref="$1"
+            ref="${ref%%@*}"                                   # 去掉 @sha256:digest
+            if [[ "${ref##*/}" == *:* ]]; then                 # 最后一段带 tag
+              local prefix="${ref%/*}" last="${ref##*/}"
+              if [[ "$prefix" == "$ref" ]]; then
+                ref="${ref%%:*}"                              # 无 '/'，直接去 tag
+              else
+                ref="${prefix}/${last%%:*}"                   # 有 '/'，只去最后一段的 tag
+              fi
+            fi
+            if [[ "$ref" == */* ]] && [[ "${ref%%/*}" == *.* || "${ref%%/*}" == *:* ]]; then
+              ref="${ref#*/}"                                  # 去掉 registry 主机前缀
+            fi
+            printf '%s' "$ref" | tr 'A-Z' 'a-z' | sed -e 's/[\/:]/-/g'
           }
 
-          # 第一轮：读入去重 -> 生成基础 tag -> 冲突预检查 -> 暂存
+          # 第一轮：读入去重 -> 生成仓库名 -> 仓库名冲突预检查 -> 暂存
           while IFS= read -r line || [[ -n "$line" ]]; do
             line=$(printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             [[ -z "$line" || "$line" =~ ^# ]] && continue
@@ -76,56 +92,55 @@ jobs:
             seen_lines["$line"]=1
 
             raw_img_ref="$line"
-            final_tag=$(make_safe_tag "$raw_img_ref")
+            repo_name=$(repo_name_of "$raw_img_ref")
 
-            if [[ -n "${seen_final_tag[$final_tag]}" ]]; then
-              echo "[FATAL CONFLICT] target tag collision: $final_tag, line: $line"
+            if [[ -n "${seen_repo[$repo_name]}" ]]; then
+              echo "[FATAL CONFLICT] repository collision: ${repo_name}  (${seen_repo[$repo_name]}  vs  $line)"
               exit 1
             fi
-            seen_final_tag["$final_tag"]=1
+            seen_repo["$repo_name"]="$line"
 
             raw_refs+=("$raw_img_ref")
-            final_tags+=("$final_tag")
+            repo_names+=("$repo_name")
           done < images.txt
 
-          echo "| Source | Version | ACR tags | Digest (ACR v2) |" >> "$SUMMARY"
-          echo "|---|---|---|---|" >> "$SUMMARY"
+          echo "| Source | Version | Repository | Tags | Digest (ACR v2) |" >> "$SUMMARY"
+          echo "|---|---|---|---|---|" >> "$SUMMARY"
 
-          for idx in "${!final_tags[@]}"; do
+          for idx in "${!repo_names[@]}"; do
             raw_img_ref="${raw_refs[$idx]}"
-            base_tag="${final_tags[$idx]}"
-            main_image="${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${TARGET_REPO}:${base_tag}"
+            repo_name="${repo_names[$idx]}"
+            main_image="${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${repo_name}:latest"
 
             echo "============================================================"
-            echo "[SYNC] docker://${raw_img_ref} -> :${base_tag}  (linux/${MIRROR_ARCH}, v2s2)"
+            echo "[SYNC] docker://${raw_img_ref} -> ${ALIYUN_NAME_SPACE}/${repo_name}:latest  (linux/${MIRROR_ARCH}, v2s2)"
 
-            # 1) 版本号：直接读 image config 的 Labels（--config 最可靠，不依赖 inspect 的顶层派生字段）
+            # 1) 版本号：直接读 image config 的 Labels（--config 最可靠）
             skopeo inspect --config --override-os linux --override-arch "${MIRROR_ARCH}" \
               --authfile "${AUTHFILE}" "docker://${raw_img_ref}" > /tmp/_cfg.json 2>/dev/null || true
             version=$(python3 -c 'import json;d=json.load(open("/tmp/_cfg.json"));print(((d.get("config") or {}).get("Labels") or {}).get("org.opencontainers.image.version","") or "")' 2>/dev/null || echo "")
-            # fallback：--config 若取不到（个别 skopeo 版本对多架构 index 的 --config 行为差异），改用默认 inspect 的顶层 Labels
+            # fallback：--config 取不到时改用默认 inspect 的顶层 Labels
             if [[ -z "$version" ]]; then
               skopeo inspect --override-os linux --override-arch "${MIRROR_ARCH}" \
                 --authfile "${AUTHFILE}" "docker://${raw_img_ref}" > /tmp/_inspect.json 2>/dev/null || true
               version=$(python3 -c 'import json;print((json.load(open("/tmp/_inspect.json")).get("Labels") or {}).get("org.opencontainers.image.version","") or "")' 2>/dev/null || echo "")
             fi
-            # 源 digest：所选平台 manifest 的 digest（仅记录）
             src_digest=$(skopeo inspect --override-os linux --override-arch "${MIRROR_ARCH}" \
               --authfile "${AUTHFILE}" --format '{{.Digest}}' "docker://${raw_img_ref}" 2>/dev/null || echo "")
             echo "[INFO] version=${version:-<none>}  src_digest=${src_digest:-<none>}"
 
-            # 2) 推主 tag（latest 内容，强制转 Docker v2）
+            # 2) 推 latest tag（强制转 Docker v2；ACR 会自动创建新仓库）
             if skopeo copy --retry-times 3 --format v2s2 \
                  --override-os linux --override-arch "${MIRROR_ARCH}" \
                  --authfile "${AUTHFILE}" \
                  "docker://${raw_img_ref}" \
                  "docker://${main_image}"; then
-              echo "[SUCCESS] ${raw_img_ref} -> :${base_tag}"
+              echo "[SUCCESS] ${raw_img_ref} -> ${repo_name}:latest"
               success_count=$((success_count + 1))
             else
-              echo "[FAIL] ${raw_img_ref} -> :${base_tag}"
+              echo "[FAIL] ${raw_img_ref} -> ${repo_name}:latest"
               fail_count=$((fail_count + 1))
-              echo "| ${raw_img_ref} | ${version:-?} | ${base_tag} (failed) | - |" >> "$SUMMARY"
+              echo "| ${raw_img_ref} | ${version:-?} | ${repo_name} | latest (failed) | - |" >> "$SUMMARY"
               continue
             fi
 
@@ -133,34 +148,35 @@ jobs:
             acr_digest=$(skopeo inspect --authfile "${AUTHFILE}" --format '{{.Digest}}' \
                            "docker://${main_image}" 2>/dev/null || true)
 
-            # 4) 打版本号 tag（已存在同 digest 则跳过，避免重复传输）
-            ver_tags_field="${base_tag}"
+            # 4) 打版本号 tag（同仓库内 :<version>；已存在同 digest 则跳过）
+            tags_field="latest"
             if [[ -n "$version" ]]; then
-              ver_tag="${base_tag}-$(make_safe_tag "$version")"
-              ver_tags_field="${base_tag} / ${ver_tag}"
-              ver_image="${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${TARGET_REPO}:${ver_tag}"
+              ver_image="${ALIYUN_REGISTRY}/${ALIYUN_NAME_SPACE}/${repo_name}:${version}"
               existing=$(skopeo inspect --authfile "${AUTHFILE}" --format '{{.Digest}}' "docker://${ver_image}" 2>/dev/null || true)
               if [[ -n "$acr_digest" && "$existing" == "$acr_digest" ]]; then
-                echo "[SKIP] :${ver_tag} 已存在且 digest 一致"
+                echo "[SKIP] ${repo_name}:${version} 已存在且 digest 一致"
+                tags_field="latest / ${version}"
               else
                 if skopeo copy --retry-times 3 --format v2s2 \
                      --override-os linux --override-arch "${MIRROR_ARCH}" \
                      --authfile "${AUTHFILE}" \
                      "docker://${raw_img_ref}" \
                      "docker://${ver_image}"; then
-                  echo "[SUCCESS] ${raw_img_ref} -> :${ver_tag}"
+                  echo "[SUCCESS] ${raw_img_ref} -> ${repo_name}:${version}"
                   success_count=$((success_count + 1))
+                  tags_field="latest / ${version}"
                 else
-                  echo "[FAIL] ${raw_img_ref} -> :${ver_tag}"
+                  echo "[FAIL] ${raw_img_ref} -> ${repo_name}:${version}"
                   fail_count=$((fail_count + 1))
+                  tags_field="latest (版本tag失败)"
                 fi
               fi
             else
-              echo "[WARN] 源镜像 label 中没有版本号，跳过版本 tag"
+              echo "[WARN] 源镜像 label 中没有版本号，只推 latest"
             fi
 
             echo "[INFO] acr_digest=${acr_digest:-<unknown>}"
-            echo "| ${raw_img_ref} | ${version:-?} | ${ver_tags_field} | ${acr_digest:-?} |" >> "$SUMMARY"
+            echo "| ${raw_img_ref} | ${version:-?} | ${repo_name} | ${tags_field} | ${acr_digest:-?} |" >> "$SUMMARY"
           done
 
           echo "===== SYNC SUMMARY ====="
